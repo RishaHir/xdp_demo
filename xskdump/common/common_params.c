@@ -99,7 +99,7 @@ void __attribute__((optimize("O0"))) parse_cmdline_args(int argc, char **argv,
 	}
 
 	/* Parse commands line args */
-	while ((opt = getopt_long(argc, argv, "hd:r:L:R:ASNFU:MQ:czpq",
+	while ((opt = getopt_long(argc, argv, "hd:r:L:R:ASNFU:MQ:czpqt",
 				  long_options, &longindex)) != -1) {
 		switch (opt) {
 		case 'd':
@@ -188,6 +188,9 @@ void __attribute__((optimize("O0"))) parse_cmdline_args(int argc, char **argv,
 			break;
 		case 4: /* --unload-all */
 			cfg->unload_all = true;
+			break;
+		case 't':
+			cfg->do_tx_demo = true;
 			break;
 		case 'h':
 			full_help = true;

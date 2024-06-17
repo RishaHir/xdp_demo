@@ -32,6 +32,7 @@ struct config {
 	int xsk_if_queue;
 	bool xsk_poll_mode;
 	bool unload_all;
+	bool do_tx_demo;
 };
 
 /* Defined in common_params.o */

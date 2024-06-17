@@ -51,9 +51,10 @@
 
 static struct xdp_program *prog;
 int xsk_map_fd;
-bool custom_xsk = false;
+
 struct config cfg = {
 	.ifindex   = -1,
+	.do_tx_demo = false,
 };
 
 struct xsk_umem_info {
@@ -133,6 +134,9 @@ static const struct option_wrapper long_options[] = {
 	{{"progname",	 required_argument,	NULL,  2  },
 	 "Load program from function <name> in the ELF file", "<name>"},
 
+	{{"tx-demo",	 no_argument,		NULL, 't' },
+	 "Transmits packets with all bytes changed to 'A'"},
+	
 	{{0, 0, NULL,  0 }, NULL, false}
 };
 
@@ -189,7 +193,6 @@ static struct xsk_socket_info *xsk_configure_socket(struct config *cfg,
 	uint32_t idx;
 	int i;
 	int ret;
-	uint32_t prog_id;
 
 	xsk_info = calloc(1, sizeof(*xsk_info));
 	if (!xsk_info)
@@ -200,22 +203,16 @@ static struct xsk_socket_info *xsk_configure_socket(struct config *cfg,
 	xsk_cfg.tx_size = XSK_RING_PROD__DEFAULT_NUM_DESCS;
 	xsk_cfg.xdp_flags = cfg->xdp_flags;
 	xsk_cfg.bind_flags = cfg->xsk_bind_flags;
-	xsk_cfg.libbpf_flags = (custom_xsk) ? XSK_LIBBPF_FLAGS__INHIBIT_PROG_LOAD: 0;
+	xsk_cfg.libbpf_flags = XSK_LIBBPF_FLAGS__INHIBIT_PROG_LOAD;
 	ret = xsk_socket__create(&xsk_info->xsk, cfg->ifname,
 				 cfg->xsk_if_queue, umem->umem, &xsk_info->rx,
 				 &xsk_info->tx, &xsk_cfg);
 	if (ret)
 		goto error_exit;
 
-	if (custom_xsk) {
-		ret = xsk_socket__update_xskmap(xsk_info->xsk, xsk_map_fd);
-		if (ret)
-			goto error_exit;
-	} else {
-		/* Getting the program ID must be after the xdp_socket__create() call */
-		if (bpf_xdp_query_id(cfg->ifindex, cfg->xdp_flags, &prog_id))
-			goto error_exit;
-	}
+	ret = xsk_socket__update_xskmap(xsk_info->xsk, xsk_map_fd);
+	if (ret)
+		goto error_exit;
 
 	/* Initialize umem frame allocation */
 	for (i = 0; i < NUM_FRAMES; i++)
@@ -360,7 +357,7 @@ static bool process_packet(struct xsk_socket_info *xsk,
 	}
 
 	// the tx portion
-	if (true) {
+	if (cfg.do_tx_demo) {
 		int ret;
 		uint32_t tx_idx = 0;
 		/* Here we sent the packet out of the receive port. Note that
@@ -505,49 +502,45 @@ int main(int argc, char **argv)
 		snprintf(cfg.filename, 512, "af_xdp_kern.o");
 	}
 
-	/* Load custom program if configured */
-	if (cfg.filename[0] != 0) {
-		struct bpf_map *map;
+	struct bpf_map *map;
 
-		custom_xsk = true;
+	xdp_opts.open_filename = cfg.filename;
+	xdp_opts.prog_name = cfg.progname;
+	xdp_opts.opts = &opts;
+
+	if (cfg.progname[0] != 0) {
 		xdp_opts.open_filename = cfg.filename;
 		xdp_opts.prog_name = cfg.progname;
 		xdp_opts.opts = &opts;
 
-		if (cfg.progname[0] != 0) {
-			xdp_opts.open_filename = cfg.filename;
-			xdp_opts.prog_name = cfg.progname;
-			xdp_opts.opts = &opts;
+		prog = xdp_program__create(&xdp_opts);
+	} else {
+		prog = xdp_program__open_file(cfg.filename,
+						NULL, &opts);
+	}
+	err = libxdp_get_error(prog);
+	if (err) {
+		libxdp_strerror(err, errmsg, sizeof(errmsg));
+		fprintf(stderr, "ERR: loading program: %s\n", errmsg);
+		return err;
+	}
 
-			prog = xdp_program__create(&xdp_opts);
-		} else {
-			prog = xdp_program__open_file(cfg.filename,
-						  NULL, &opts);
-		}
-		err = libxdp_get_error(prog);
-		if (err) {
-			libxdp_strerror(err, errmsg, sizeof(errmsg));
-			fprintf(stderr, "ERR: loading program: %s\n", errmsg);
-			return err;
-		}
+	err = xdp_program__attach(prog, cfg.ifindex, cfg.attach_mode, 0);
 
-		err = xdp_program__attach(prog, cfg.ifindex, cfg.attach_mode, 0);
+	if (err) {
+		libxdp_strerror(err, errmsg, sizeof(errmsg));
+		fprintf(stderr, "Couldn't attach XDP program on iface '%s' : %s (%d)\n",
+			cfg.ifname, errmsg, err);
+		return err;
+	}
 
-		if (err) {
-			libxdp_strerror(err, errmsg, sizeof(errmsg));
-			fprintf(stderr, "Couldn't attach XDP program on iface '%s' : %s (%d)\n",
-				cfg.ifname, errmsg, err);
-			return err;
-		}
-
-		/* We also need to load the xsks_map */
-		map = bpf_object__find_map_by_name(xdp_program__bpf_obj(prog), "xsks_map");
-		xsk_map_fd = bpf_map__fd(map);
-		if (xsk_map_fd < 0) {
-			fprintf(stderr, "ERROR: no xsks map found: %s\n",
-				strerror(xsk_map_fd));
-			exit(EXIT_FAILURE);
-		}
+	/* We also need to load the xsks_map */
+	map = bpf_object__find_map_by_name(xdp_program__bpf_obj(prog), "xsks_map");
+	xsk_map_fd = bpf_map__fd(map);
+	if (xsk_map_fd < 0) {
+		fprintf(stderr, "ERROR: no xsks map found: %s\n",
+			strerror(xsk_map_fd));
+		exit(EXIT_FAILURE);
 	}
 
 	/* Allow unlimited locking of memory, so all memory needed for packet
