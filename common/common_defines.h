@@ -9,7 +9,13 @@
 #include <net/if.h>
 #include <linux/types.h>
 #include <stdbool.h>
+#include <xdp/xsk.h>
 #include <xdp/libxdp.h>
+
+#define NUM_FRAMES         4096
+#define FRAME_SIZE         XSK_UMEM__DEFAULT_FRAME_SIZE
+#define BATCH_SIZE      64
+#define INVALID_UMEM_FRAME UINT64_MAX
 
 struct config {
 	enum xdp_attach_mode attach_mode;
@@ -32,10 +38,36 @@ struct config {
 	int xsk_if_queue;
 	bool xsk_poll_mode;
 	bool unload_all;
+	bool do_tx_demo;
+	bool print_stats;
+};
+
+struct stats_record {
+	uint64_t timestamp;
+	uint64_t rx_packets;
+	uint64_t rx_bytes;
+	uint64_t tx_packets;
+	uint64_t tx_bytes;
+};
+
+struct xsk_socket_info {
+	struct xsk_ring_cons rx;
+	struct xsk_ring_prod tx;
+	struct xsk_umem_info *umem;
+	struct xsk_socket *xsk;
+
+	uint64_t umem_frame_addr[NUM_FRAMES];
+	uint32_t umem_frame_free;
+
+	uint32_t outstanding_tx;
+
+	struct stats_record stats;
+	struct stats_record prev_stats;
 };
 
 /* Defined in common_params.o */
 extern int verbose;
+extern bool global_exit;
 
 /* Exit return codes */
 #define EXIT_OK 		 0 /* == EXIT_SUCCESS (stdlib.h) man exit(3) */

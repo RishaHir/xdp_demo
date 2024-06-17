@@ -1,3 +1,8 @@
+// This work is based on:
+// https://github.com/xdp-project/xdp-tutorial/tree/master/advanced03-AF_XDP
+// The files were modified 14.6.2024 by Richard Hyroš
+// There is no warranty of any kind
+
 /* Common BPF/XDP functions used by userspace side programs */
 #ifndef __COMMON_USER_BPF_XDP_H
 #define __COMMON_USER_BPF_XDP_H

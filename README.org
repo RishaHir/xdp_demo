@@ -1,0 +1,86 @@
+** Známé problémy:
+
+ xsk-dump má problém fungovat pokud se pustí na interface s vyššími indexy front. (tj funguje pro IF s frontami 0-7 ale ne pro IF s frontami 8-15) \\
+ xsk-dump -t se sekne - pravděpodobně ten samý problém (ukázka by měla vzít paket z RX a dát ho na TX) 
+
+Dema jsou ve složkách xsk-dump a xsk-generate
+Ukázky XDP programů jsou ve složce bpf.
+Pro testování ukázek samostatných XDP programů je vhodné použít programy:
+#+begin_example sh
+$ sudo tcpdump -ntq -i IFNAME > /dev/null
+$ sudo tcpreplay -K -t -i IFNAME bigFlows.pcap
+#+end_example
+
+** Jak načíst modul: (2 ports 8 queues each - always use all the queues)
+#+begin_example sh
+$ sudo insmod drivers/kernel/drivers/nfb/nfb.ko net_enable="yes" net_rxqs_count="8" net_txqs_count="8"
+#+end_example
+
+Pokud se u demíček nepoužije parametr -Q, pak automaticky defaultují na queue 0.
+Jelikož demíčka otevírají jenom jeden socket / queue, tak je dobré vypnout rozhazování na RX.
+#+begin_example sh
+$ nfb-bus -p /firmware/mi_bus0/application/app_core_minimal_0/rx_chan_router 0 0x00000001
+$ nfb-bus -p /firmware/mi_bus0/application/app_core_minimal_1/rx_chan_router 0 0x00000001
+#+end_example
+
+** Userspace dema:
+
+Full packet dump
+#+begin_example sh
+$ sudo ./xsk-dump -d IFNAME
+IP6
+src MAC: 00:11:17:60:07:e0
+dst MAC: 33:33:00:00:00:02
+src IP: fe80::9c1b:d143:5c91:6fab
+dst IP: ff02::2
+length: 62 bytes
+0x0000: 3333 0000 0002 0011 1760 07e0 86dd 600b 33...... .`....`.
+0x0010: 938c 0008 3aff fe80 0000 0000 0000 9c1b ....:... ........
+0x0020: d143 5c91 6fab ff02 0000 0000 0000 0000 .C\.o... ........
+0x0030: 0000 0000 0002 8500 439b 0000 0000      ........ C.....
+#+end_example
+Nonverbose packet dump
+#+begin_example sh
+$ sudo ./xsk-dump -d IFNAME -q
+Got packet length: 256 bytes
+Got packet length: 256 bytes
+Got packet length: 256 bytes
+Got packet length: 256 bytes
+Got packet length: 256 bytes
+Got packet length: 256 bytes
+#+end_example
+Stats packet dump
+#+begin_example sh
+sudo ./xsk-dump -d IFNAME -s
+AF_XDP RX:    16,018,503 pkts ( 8,008,740 pps)   4,100,736 Kbytes (16,402 Mbits/s) period:2.000128
+       TX:             0 pkts (         0 pps)           0 Kbytes (     0 Mbits/s) period:2.000128
+#+end_example
+Stats packet generate
+#+begin_example sh
+sudo ./xsk-generate -d IFNAME -s
+AF_XDP RX:             0 pkts (         0 pps)           0 Kbytes (     0 Mbits/s) period:2.000092
+       TX:    27,412,224 pkts (13,705,484 pps)   7,017,537 Kbytes (28,069 Mbits/s) period:2.000092
+#+end_example
+
+** Načítání XDP programů:
+
+#+begin_example sh
+$ sudo xdp-loader load IF_NAME xdp_drop.o
+#+end_example
+
+** Status:
+#+begin_example sh
+$ sudo xdp-loader status
+CURRENT XDP PROGRAM STATUS:
+
+Interface        Prio  Program name      Mode     ID   Tag               Chain actions
+--------------------------------------------------------------------------------------
+IFNAME                xdp_dispatcher    native   3374 90f686eb86991928
+ =>              50     xdp_drop_prog             3383 57cd311f2e27366b  XDP_PASS
+#+end_example
+
+** Unload
+
+#+begin_example sh
+$ sudo xdp-loader unload IFNAME --all
+#+end_example

@@ -23,11 +23,8 @@ int xdp_dump_prog(struct xdp_md *ctx)
     /* A set entry here means that the correspnding queue_id
      * has an active AF_XDP socket bound to it. */
     if (bpf_map_lookup_elem(&xsks_map, &index)) {
-        bpf_printk("LOG: Inside xdp_sock_prog() - returning redirect;\n");
         return bpf_redirect_map(&xsks_map, index, 0);
     }
-
-    bpf_printk("LOG: Inside xdp_sock_prog() - passing packet;\n");
 
     return XDP_PASS;
 }

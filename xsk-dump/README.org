@@ -101,7 +101,7 @@ allocating memory and copying over the frame.
 
 
 #+begin_example sh
-$ sudo sudo ./af_xdp_user -d IFNAME
+$ sudo sudo ./xsk-dump -d IFNAME
 IP6
 src MAC: 00:11:17:60:07:e0
 dst MAC: 33:33:00:00:00:02

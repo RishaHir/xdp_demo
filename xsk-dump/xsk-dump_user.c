@@ -30,8 +30,9 @@
 #include <linux/ipv6.h>
 #include <linux/icmpv6.h>
 
-#include "common/common_params.h"
-#include "common/common_user_bpf_xdp.h"
+#include "../common/common_params.h"
+#include "../common/common_user_bpf_xdp.h"
+#include "../common/common_stats.h"
 
 #include <linux/if_packet.h>
 #include <sys/socket.h>
@@ -43,17 +44,15 @@
 #include <netinet/tcp.h>
 #include <netinet/udp.h>
 #include <net/if.h> 
-
-#define NUM_FRAMES         4096
-#define FRAME_SIZE         XSK_UMEM__DEFAULT_FRAME_SIZE
-#define RX_BATCH_SIZE      64
-#define INVALID_UMEM_FRAME UINT64_MAX
+#include <net/ethernet.h>
 
 static struct xdp_program *prog;
 int xsk_map_fd;
-bool custom_xsk = false;
+
 struct config cfg = {
 	.ifindex   = -1,
+	.do_tx_demo = false,
+	.print_stats = false,
 };
 
 struct xsk_umem_info {
@@ -61,27 +60,6 @@ struct xsk_umem_info {
 	struct xsk_ring_cons cq;
 	struct xsk_umem *umem;
 	void *buffer;
-};
-struct stats_record {
-	uint64_t timestamp;
-	uint64_t rx_packets;
-	uint64_t rx_bytes;
-	uint64_t tx_packets;
-	uint64_t tx_bytes;
-};
-struct xsk_socket_info {
-	struct xsk_ring_cons rx;
-	struct xsk_ring_prod tx;
-	struct xsk_umem_info *umem;
-	struct xsk_socket *xsk;
-
-	uint64_t umem_frame_addr[NUM_FRAMES];
-	uint32_t umem_frame_free;
-
-	uint32_t outstanding_tx;
-
-	struct stats_record stats;
-	struct stats_record prev_stats;
 };
 
 static inline __u32 xsk_ring_prod__free(struct xsk_ring_prod *r)
@@ -94,49 +72,54 @@ static const char *__doc__ = "AF_XDP kernel bypass example\n";
 
 static const struct option_wrapper long_options[] = {
 
-	{{"help",	 no_argument,		NULL, 'h' },
+	{{"help",	 		no_argument,		NULL, 'h' },
 	 "Show help", false},
 
-	{{"dev",	 required_argument,	NULL, 'd' },
+	{{"dev",			required_argument,	NULL, 'd' },
 	 "Operate on device <ifname>", "<ifname>", true},
 
-	{{"skb-mode",	 no_argument,		NULL, 'S' },
+	{{"skb-mode",	 	no_argument,		NULL, 'S' },
 	 "Install XDP program in SKB (AKA generic) mode"},
 
-	{{"native-mode", no_argument,		NULL, 'N' },
+	{{"native-mode",	no_argument,		NULL, 'N' },
 	 "Install XDP program in native mode"},
 
-	{{"auto-mode",	 no_argument,		NULL, 'A' },
+	{{"auto-mode",		no_argument,		NULL, 'A' },
 	 "Auto-detect SKB or native mode"},
 
-	{{"force",	 no_argument,		NULL, 'F' },
+	{{"force",	 		no_argument,		NULL, 'F' },
 	 "Force install, replacing existing program on interface"},
 
-	{{"copy",        no_argument,		NULL, 'c' },
+	{{"copy",			no_argument,		NULL, 'c' },
 	 "Force copy mode"},
 
-	{{"zero-copy",	 no_argument,		NULL, 'z' },
+	{{"zero-copy",		no_argument,		NULL, 'z' },
 	 "Force zero-copy mode"},
 
-	{{"queue",	 required_argument,	NULL, 'Q' },
+	{{"queue",			required_argument,	NULL, 'Q' },
 	 "Configure interface receive queue for AF_XDP, default=0"},
 
-	{{"poll-mode",	 no_argument,		NULL, 'p' },
+	{{"poll-mode",		no_argument,		NULL, 'p' },
 	 "Use the poll() API waiting for packets to arrive"},
 
-	{{"quiet",	 no_argument,		NULL, 'q' },
+	{{"quiet",			no_argument,		NULL, 'q' },
 	 "Quiet mode (no output)"},
 
-	{{"filename",    required_argument,	NULL,  1  },
+	{{"filename",		required_argument,	NULL,  1  },
 	 "Load program from <file>", "<file>"},
 
-	{{"progname",	 required_argument,	NULL,  2  },
+	{{"progname",		required_argument,	NULL,  2  },
 	 "Load program from function <name> in the ELF file", "<name>"},
 
+	{{"tx-demo",		no_argument,		NULL, 't' },
+	 "Transmits packets with all bytes changed to 'A'"},
+
+	{{"print-stats",	no_argument,		NULL, 's' },
+	 "prints stats"},
+	
 	{{0, 0, NULL,  0 }, NULL, false}
 };
 
-static bool global_exit;
 
 static struct xsk_umem_info *configure_xsk_umem(void *buffer, uint64_t size)
 {
@@ -189,7 +172,6 @@ static struct xsk_socket_info *xsk_configure_socket(struct config *cfg,
 	uint32_t idx;
 	int i;
 	int ret;
-	uint32_t prog_id;
 
 	xsk_info = calloc(1, sizeof(*xsk_info));
 	if (!xsk_info)
@@ -200,22 +182,16 @@ static struct xsk_socket_info *xsk_configure_socket(struct config *cfg,
 	xsk_cfg.tx_size = XSK_RING_PROD__DEFAULT_NUM_DESCS;
 	xsk_cfg.xdp_flags = cfg->xdp_flags;
 	xsk_cfg.bind_flags = cfg->xsk_bind_flags;
-	xsk_cfg.libbpf_flags = (custom_xsk) ? XSK_LIBBPF_FLAGS__INHIBIT_PROG_LOAD: 0;
+	xsk_cfg.libbpf_flags = XSK_LIBBPF_FLAGS__INHIBIT_PROG_LOAD;
 	ret = xsk_socket__create(&xsk_info->xsk, cfg->ifname,
 				 cfg->xsk_if_queue, umem->umem, &xsk_info->rx,
 				 &xsk_info->tx, &xsk_cfg);
 	if (ret)
 		goto error_exit;
 
-	if (custom_xsk) {
-		ret = xsk_socket__update_xskmap(xsk_info->xsk, xsk_map_fd);
-		if (ret)
-			goto error_exit;
-	} else {
-		/* Getting the program ID must be after the xdp_socket__create() call */
-		if (bpf_xdp_query_id(cfg->ifindex, cfg->xdp_flags, &prog_id))
-			goto error_exit;
-	}
+	ret = xsk_socket__update_xskmap(xsk_info->xsk, xsk_map_fd);
+	if (ret)
+		goto error_exit;
 
 	/* Initialize umem frame allocation */
 	for (i = 0; i < NUM_FRAMES; i++)
@@ -355,12 +331,15 @@ static bool process_packet(struct xsk_socket_info *xsk,
 	uint8_t *pkt = xsk_umem__get_data(xsk->umem->buffer, addr);
 
 	// prints packet contents tcpdump style
-	if (verbose) {
+	if (verbose && !cfg.print_stats) {
 		print_packet(pkt, len);
+		
+	} else if (!cfg.print_stats){
+		printf("Got packet length: %d bytes\n", len);
 	}
 
 	// the tx portion
-	if (true) {
+	if (cfg.do_tx_demo) {
 		int ret;
 		uint32_t tx_idx = 0;
 		/* Here we sent the packet out of the receive port. Note that
@@ -395,7 +374,7 @@ static void handle_receive_packets(struct xsk_socket_info *xsk)
 	uint32_t idx_rx = 0, idx_fq = 0;
 	int ret;
 
-	rcvd = xsk_ring_cons__peek(&xsk->rx, RX_BATCH_SIZE, &idx_rx);
+	rcvd = xsk_ring_cons__peek(&xsk->rx, BATCH_SIZE, &idx_rx);
 	if (!rcvd)
 		return;
 
@@ -474,6 +453,8 @@ static void exit_application(int signal)
 	global_exit = true;
 }
 
+
+
 int main(int argc, char **argv)
 {
 	int ret;
@@ -484,6 +465,7 @@ int main(int argc, char **argv)
 	struct rlimit rlim = {RLIM_INFINITY, RLIM_INFINITY};
 	struct xsk_umem_info *umem;
 	struct xsk_socket_info *xsk_socket;
+	pthread_t stats_poll_thread;
 	int err;
 	char errmsg[1024];
 
@@ -502,52 +484,48 @@ int main(int argc, char **argv)
 
 	// if no program load af_xdp_kern.o
 	if (cfg.filename[0] == 0) {
-		snprintf(cfg.filename, 512, "af_xdp_kern.o");
+		snprintf(cfg.filename, 512, "xsk-dump_kern.o");
 	}
 
-	/* Load custom program if configured */
-	if (cfg.filename[0] != 0) {
-		struct bpf_map *map;
+	struct bpf_map *map;
 
-		custom_xsk = true;
+	xdp_opts.open_filename = cfg.filename;
+	xdp_opts.prog_name = cfg.progname;
+	xdp_opts.opts = &opts;
+
+	if (cfg.progname[0] != 0) {
 		xdp_opts.open_filename = cfg.filename;
 		xdp_opts.prog_name = cfg.progname;
 		xdp_opts.opts = &opts;
 
-		if (cfg.progname[0] != 0) {
-			xdp_opts.open_filename = cfg.filename;
-			xdp_opts.prog_name = cfg.progname;
-			xdp_opts.opts = &opts;
+		prog = xdp_program__create(&xdp_opts);
+	} else {
+		prog = xdp_program__open_file(cfg.filename,
+						NULL, &opts);
+	}
+	err = libxdp_get_error(prog);
+	if (err) {
+		libxdp_strerror(err, errmsg, sizeof(errmsg));
+		fprintf(stderr, "ERR: loading program: %s\n", errmsg);
+		return err;
+	}
 
-			prog = xdp_program__create(&xdp_opts);
-		} else {
-			prog = xdp_program__open_file(cfg.filename,
-						  NULL, &opts);
-		}
-		err = libxdp_get_error(prog);
-		if (err) {
-			libxdp_strerror(err, errmsg, sizeof(errmsg));
-			fprintf(stderr, "ERR: loading program: %s\n", errmsg);
-			return err;
-		}
+	err = xdp_program__attach(prog, cfg.ifindex, cfg.attach_mode, 0);
 
-		err = xdp_program__attach(prog, cfg.ifindex, cfg.attach_mode, 0);
+	if (err) {
+		libxdp_strerror(err, errmsg, sizeof(errmsg));
+		fprintf(stderr, "Couldn't attach XDP program on iface '%s' : %s (%d)\n",
+			cfg.ifname, errmsg, err);
+		return err;
+	}
 
-		if (err) {
-			libxdp_strerror(err, errmsg, sizeof(errmsg));
-			fprintf(stderr, "Couldn't attach XDP program on iface '%s' : %s (%d)\n",
-				cfg.ifname, errmsg, err);
-			return err;
-		}
-
-		/* We also need to load the xsks_map */
-		map = bpf_object__find_map_by_name(xdp_program__bpf_obj(prog), "xsks_map");
-		xsk_map_fd = bpf_map__fd(map);
-		if (xsk_map_fd < 0) {
-			fprintf(stderr, "ERROR: no xsks map found: %s\n",
-				strerror(xsk_map_fd));
-			exit(EXIT_FAILURE);
-		}
+	/* We also need to load the xsks_map */
+	map = bpf_object__find_map_by_name(xdp_program__bpf_obj(prog), "xsks_map");
+	xsk_map_fd = bpf_map__fd(map);
+	if (xsk_map_fd < 0) {
+		fprintf(stderr, "ERROR: no xsks map found: %s\n",
+			strerror(xsk_map_fd));
+		exit(EXIT_FAILURE);
 	}
 
 	/* Allow unlimited locking of memory, so all memory needed for packet
@@ -583,6 +561,17 @@ int main(int argc, char **argv)
 		fprintf(stderr, "ERROR: Can't setup AF_XDP socket \"%s\"\n",
 			strerror(errno));
 		exit(EXIT_FAILURE);
+	}
+
+	/* Start thread to do statistics display */
+	if (cfg.print_stats) {
+		ret = pthread_create(&stats_poll_thread, NULL, stats_poll,
+				     xsk_socket);
+		if (ret) {
+			fprintf(stderr, "ERROR: Failed creating statistics thread "
+				"\"%s\"\n", strerror(errno));
+			exit(EXIT_FAILURE);
+		}
 	}
 
 	// TODO

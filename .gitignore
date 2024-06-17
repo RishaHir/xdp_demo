@@ -1,3 +1,4 @@
-.vscode/
+.vscode/launch.json
 *.o
-af_xdp_user
+xsk-dump/xsk-dump
+xsk-generate/xsk-generate
