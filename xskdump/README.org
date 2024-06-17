@@ -1,0 +1,157 @@
+# -*- fill-column: 76; -*-
+#+TITLE: XDP user space delivery via AF_XDP
+#+OPTIONS: ^:nil
+
+** Disclaimer
+This work is based on:
+https://github.com/xdp-project/xdp-tutorial/tree/master/advanced03-AF_XDP
+The files were modified 14.6.2024 by Richard Hyroš
+There is no warranty of any kind
+
+** Where does AF_XDP performance come from?
+
+It is important to understand that XDP in-itself is not a kernel bypass
+facility. XDP is an *in-kernel* fast-path, that operates on raw-frames
+"inline" before they reach the normal Linux Kernel network stack.
+
+To support fast delivery of /raw-frames into user space/, XDP can *bypass*
+the Linux Kernel network stack via XDP_REDIRECT'ing into a special BPF-map
+containing AF_XDP sockets. The AF_XDP socket is an new Address Family type.
+([[https://www.kernel.org/doc/html/latest/networking/af_xdp.html][The kernel documentation for AF_XDP]]).
+
+The AF_XDP socket is really fast, but what the secret behind this
+performance boost?
+
+One of the basic ideas behind AF_XDP dates back to [[https://en.wikipedia.org/wiki/Van_Jacobson][Van Jacobson]]'s talk about
+[[https://lwn.net/Articles/169961/][network channels]]. It is about creating a Lock-free [[https://lwn.net/Articles/169961/][channel]] directly from
+driver RX-queue into an (AF_XDP) socket.
+
+The basic queues used by AF_XDP are Single-Producer/Single-Consumer (SPSC)
+descriptor ring queues:
+
+- The *Single-Producer* (SP) bind to specific RX *queue id*, and
+  NAPI-softirq assures only 1-CPU process 1-RX-queue id (per scheduler
+  interval).
+
+- The *Single-Consumer* (SC) is one-application, reading descriptors from
+  a ring, that point into UMEM area.
+
+There are *no memory allocation* per packet. Instead the UMEM memory area
+used for packets is pre-allocated and thereby bounded. The UMEM area
+consists of a number of equally sized chunks, that user space have registered
+with the kernel (via XDP_UMEM_REG setsockopt system call). *Importantly*:
+This also means that you are responsible for returning frames to UMEM in
+timely manner, and pre-allocated enough for your application usage pattern.
+
+The [[http://www.lemis.com/grog/Documentation/vj/lca06vj.pdf][transport signature]]
+that Van Jacobson talked about, are replaced by the XDP/eBPF program choosing which
+AF_XDP socket to XDP_REDIRECT into.
+
+** Details: Actually four SPSC ring queues
+
+As explained in the [[ https://www.kernel.org/doc/html/latest/networking/af_xdp.html][AF_XDP kernel doc]]
+there are actually 4 SPSC ring queues.
+
+In summary: the AF_XDP /socket/ has two rings for *RX* and *TX*, which
+contain descriptors that point into UMEM area. The UMEM area has two rings:
+*FILL* ring and *COMPLETION* ring. In the *FILL* ring: the application gives
+the kernel a packet area to *RX* fill. In the *COMPLETION* ring, the kernel
+tells the application that *TX is done* for a packet area (which then can be
+reused). This scheme is for transferring ownership of UMEM packet areas
+between the kernel and the user space application.
+
+** Gotcha by RX-queue id binding
+
+The most common mistake: Why am I not seeing any traffic on the AF_XDP
+socket?
+
+As you just learned from above, the AF_XDP socket bound to a *single
+RX-queue id* (for performance reasons). Thus, your user space program is only
+receiving raw-frames from a specific RX-queue id number. NICs will by
+default spread flows with RSS-hashing over all available RX-queues. Thus,
+traffic likely not hitting queue you expect.
+
+In order to fix that problem, you *MUST* configure the NIC to steer flow to
+a specific RX-queue. This can be done via ethtool or TC HW offloading filter
+setup.
+
+Alternative work-arounds:
+1. Create as many AF_XDP sockets as RXQs, and have user space poll()/select
+   on all sockets.
+2. For testing purposes reduce RXQ number to 1,
+
+** Driver support and zero-copy mode
+
+As hinted in the intro (driver level) support for AF_XDP depend on drivers
+implementing the XDP_REDIRECT action. For all driver implementing the basic
+XDP_REDIRECT action, AF_XDP in "copy-mode" is supported. The "copy-mode" is
+surprisingly fast, and does a single-copy of the frame (including any XDP
+placed meta-data) into the UMEM area. The user space API remains the same.
+
+For AF_XDP "zero-copy" support the driver need to implement and expose the
+API for registering and using the UMEM area directly in the NIC RX-ring
+structure for DMA delivery.
+
+Depending on your use-case, it can still make sense to use the "copy-mode"
+on a "zero-copy" capable driver. If for some-reason, not all traffic on a
+RX-queue is for the AF_XDP socket, and the XDP program multiplex between
+XDP_REDIRECT and XDP_PASS, then "copy-mode" can be relevant. As in
+"zero-copy" mode doing XDP_PASS have a fairly high cost, which involves
+allocating memory and copying over the frame.
+
+
+#+begin_example sh
+$ sudo sudo ./af_xdp_user -d IFNAME
+IP6
+src MAC: 00:11:17:60:07:e0
+dst MAC: 33:33:00:00:00:02
+src IP: fe80::9c1b:d143:5c91:6fab
+dst IP: ff02::2
+length: 62 bytes
+0x0000: 3333 0000 0002 0011 1760 07e0 86dd 600b 33...... .`....`.
+0x0010: 938c 0008 3aff fe80 0000 0000 0000 9c1b ....:... ........
+0x0020: d143 5c91 6fab ff02 0000 0000 0000 0000 .C\.o... ........
+0x0030: 0000 0000 0002 8500 439b 0000 0000      ........ C.....
+#+end_example
+
+It's important to note that the AF_XDP socket creation in the case of loading
+a custom redirection program involves the use of the
+*XSK_LIBBPF_FLAGS__INHIBIT_PROG_LOAD* flag. This flag prevents the default
+kernel program from being loaded as part of the *xsk_socket__create()*
+function call. This creates an AF_XDP socket that isn't entered in any
+*XSK_MAP*. Therefore, it's important to call *xsk_socket__update_xskmap()*
+to enter the AF_XDP socket into the custom program map.
+
+
+** Checking which AF_XDP program is loaded
+
+If the default AF_XDP program is loaded you will see the name: xsk_def_prog. Otherwise,
+the name will be the custom program/section name from the custom file that was loaded.
+
+#+begin_example sh
+$ sudo xdp-loader status
+CURRENT XDP PROGRAM STATUS:
+
+Interface        Prio  Program name      Mode     ID   Tag               Chain actions
+--------------------------------------------------------------------------------------
+lo                     <No XDP program loaded!>
+IFNAME             xdp_dispatcher    native   4856 94d5f00c20184d17
+ =>              20     xsk_def_prog              4863 03b13f331978c78c  XDP_PASS
+#+end_example
+
+#+begin_example sh
+$ sudo xdp-loader status
+CURRENT XDP PROGRAM STATUS:
+
+Interface        Prio  Program name      Mode     ID   Tag               Chain actions
+--------------------------------------------------------------------------------------
+lo                     <No XDP program loaded!>
+IFNAME             xdp_dispatcher    native   4840 94d5f00c20184d17
+ =>              50     xdp_sock_prog             4847 b215b521770e63fd  XDP_PASS
+#+end_example
+
+** Unloading an AF_XDP program from the test environment interface
+
+#+begin_example sh
+$ sudo xdp-loader unload IFNAME --all
+#+end_example
